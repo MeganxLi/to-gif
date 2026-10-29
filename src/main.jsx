@@ -10,6 +10,7 @@ import {
 	ArrowRight,
 	Check,
 	Clapperboard,
+	Github,
 	Link2,
 	LoaderCircle,
 	LockKeyhole,
@@ -248,7 +249,7 @@ function App() {
 					</span>
 				</a>
 				<a href="https://github.com" target="_blank" rel="noreferrer" className="top-link">
-					開源 · GitHub <ArrowRight size={14} />
+					<Github size={14} /> Megan <ArrowRight size={14} />
 				</a>
 			</header>
 
@@ -555,7 +556,6 @@ function App() {
 					</aside>
 				</div>
 				<footer>
-					<span>LOOP © 2026</span>
 					<span>
 						MADE FOR THE MOMENTS THAT MATTER <span className="footer-heart">✳</span>
 					</span>

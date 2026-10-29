@@ -2,6 +2,13 @@
 
 Loop 可將影片轉成 GIF：你可以上傳影片檔，或貼上含公開影片的 Threads 貼文連結。影片檔的轉檔在瀏覽器中執行；Threads 連結則透過 Vercel Functions 解析並串流來源影片。
 
+<img width="2048" height="1564" alt="image" src="https://github.com/user-attachments/assets/ea612054-1566-4e73-9cfd-52b0cb483a0a" />
+
+<p align="center">
+  <a href="https://to-gif-sooty.vercel.app/">
+    <img src="https://img.shields.io/badge/Demo_website-Your?&style=for-the-badge&logo=data:image/svg%2bxml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE5IDNINUMzLjg5NTQzIDMgMyAzLjg5NTQzIDMgNVYxOUMzIDIwLjEwNDYgMy44OTU0MyAyMSA1IDIxSDE5QzIwLjEwNDYgMjEgMjEgMjAuMTA0NiAyMSAxOVY1QzIxIDMuODk1NDMgMjAuMTA0NiAzIDE5IDNaIiBzdHJva2U9IiNGMkYzRjQiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+CjxwYXRoIGQ9Ik0zIDlIMjEiIHN0cm9rZT0iI0YyRjNGNCIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KPHBhdGggZD0iTTkgMjFWOSIgc3Ryb2tlPSIjRjJGM0Y0IiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPgo8L3N2Zz4K&logoColor=ffffff&color=282828" />
+  </a>
+</p>
 ## 功能
 
 - 上傳影片檔，或讀取公開 Threads 影片貼文。

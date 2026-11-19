@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile } from "@ffmpeg/util";
+import { zipSync } from "fflate";
 import coreURL from "@ffmpeg/core?url";
 import wasmURL from "@ffmpeg/core/wasm?url";
 import {
@@ -15,6 +16,7 @@ import {
 	LoaderCircle,
 	LockKeyhole,
 	Pause,
+	Plus,
 	Play,
 	Scissors,
 	Sparkles,
@@ -27,11 +29,31 @@ import "./style.css";
 const RESOLVER = (import.meta.env.VITE_RESOLVER_URL || "/api").replace(/\/$/, "");
 const fmtTime = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 
+function getThreadsPostId(value) {
+	try {
+		const parsed = new URL(value);
+		if (!/(^|\.)threads\.(com|net)$/i.test(parsed.hostname)) return "";
+		return parsed.pathname.match(/\/post\/([^/]+)/i)?.[1] || "";
+	} catch {
+		return "";
+	}
+}
+
+function safeBaseName(value) {
+	return value.replace(/[\\/:*?"<>|]/g, "-").replace(/^\.+|\.+$/g, "") || "loop";
+}
+
 function App() {
-	const [url, setUrl] = useState("");
+	const [linkInputs, setLinkInputs] = useState([""]);
 	const [videoFile, setVideoFile] = useState(null);
 	const [videoSrc, setVideoSrc] = useState("");
 	const [gifUrl, setGifUrl] = useState("");
+	const [downloadName, setDownloadName] = useState("loop");
+	const [batchJobs, setBatchJobs] = useState([]);
+	const [batchRunning, setBatchRunning] = useState(false);
+	const [batchClipSeconds, setBatchClipSeconds] = useState(5);
+	const [batchZipUrl, setBatchZipUrl] = useState("");
+	const [activeBatchName, setActiveBatchName] = useState("");
 	const [duration, setDuration] = useState(0);
 	const [start, setStart] = useState(0);
 	const [end, setEnd] = useState(5);
@@ -59,6 +81,12 @@ function App() {
 		},
 		[gifUrl],
 	);
+	useEffect(
+		() => () => {
+			if (batchZipUrl) URL.revokeObjectURL(batchZipUrl);
+		},
+		[batchZipUrl],
+	);
 
 	async function acceptFile(file) {
 		if (!file || !file.type.startsWith("video/")) {
@@ -69,18 +97,49 @@ function App() {
 		setStatus("idle");
 		setVideoFile(file);
 		setGifUrl("");
+		setDownloadName(safeBaseName(file.name.replace(/\.[^.]+$/, "")));
 		setVideoSrc(URL.createObjectURL(file));
-		setUrl("");
+		setLinkInputs([""]);
 	}
 
 	async function loadFromLink() {
 		setError("");
+		const links = [...new Set(linkInputs.map((value) => value.trim()).filter(Boolean))];
+		if (!links.length) {
+			setError("請貼上至少一個 Threads 貼文網址。");
+			return;
+		}
+		if (links.length > 1) {
+			try {
+				if (links.length > 8) throw new Error("一次最多可加入 8 個 Threads 連結。");
+				const names = new Set();
+				const jobs = links.map((link, index) => {
+					const postId = getThreadsPostId(link);
+					if (!postId) throw new Error(`第 ${index + 1} 個連結不是有效的 Threads 貼文網址。`);
+					let name = safeBaseName(postId);
+					let suffix = 2;
+					while (names.has(name)) name = `${safeBaseName(postId)}-${suffix++}`;
+					names.add(name);
+					return { id: `${Date.now()}-${index}`, url: link, name, status: "queued", gifBlob: null, error: "" };
+				});
+				setBatchJobs(jobs);
+				setBatchZipUrl("");
+				setBatchClipSeconds(5);
+				setLinkInputs([""]);
+				setStatus("idle");
+				return;
+			} catch (e) {
+				setError(e.message || "無法加入 Threads 連結。");
+				return;
+			}
+		}
 		setStatus("loading");
 		try {
-			if (!/^https?:\/\//i.test(url.trim())) throw new Error("請貼上完整的 Threads 貼文網址。");
+			const singleUrl = links[0];
+			if (!/^https?:\/\//i.test(singleUrl)) throw new Error("請貼上完整的 Threads 貼文網址。");
 			let res;
 			try {
-				res = await fetch(`${RESOLVER}/resolve?url=${encodeURIComponent(url.trim())}`);
+				res = await fetch(`${RESOLVER}/resolve?url=${encodeURIComponent(singleUrl)}`);
 			} catch {
 				const local = ["localhost", "127.0.0.1"].includes(window.location.hostname);
 				throw new Error(
@@ -128,8 +187,11 @@ function App() {
 				throw new Error("影片代理沒有傳回影片檔。若在本機測試 Threads，請執行 npm run dev:vercel。");
 			}
 			const blob = await fileResponse.blob();
-			const file = new File([blob], "threads-video.mp4", { type: blob.type || "video/mp4" });
+			const postId = getThreadsPostId(singleUrl);
+			const name = safeBaseName(postId || "threads-video");
+			const file = new File([blob], `${name}.mp4`, { type: blob.type || "video/mp4" });
 			setVideoFile(file);
+			setDownloadName(name);
 			setVideoSrc(URL.createObjectURL(file));
 			setGifUrl("");
 			setStatus("idle");
@@ -139,43 +201,39 @@ function App() {
 		}
 	}
 
-	async function convert() {
-		if (!videoFile) return;
-		setError("");
-		setStatus("converting");
-		setProgress(0);
-		let ffmpeg;
-		let input;
-		let output;
+	async function getFFmpeg() {
+		let ffmpeg = ffmpegRef.current;
+		if (!ffmpeg) {
+			ffmpeg = new FFmpeg();
+			ffmpegLogsRef.current = [];
+			ffmpeg.on("log", ({ message }) => {
+				ffmpegLogsRef.current = [...ffmpegLogsRef.current.slice(-29), message];
+			});
+			ffmpeg.on("progress", ({ progress: value }) => setProgress(Math.max(0, Math.min(100, Math.round(value * 100)))));
+			// Bundle and serve the open-source FFmpeg core with the app. This avoids
+			// importing the core from a CDN/blob URL inside the FFmpeg web worker.
+			await ffmpeg.load({
+				coreURL: new URL(coreURL, window.location.href).href,
+				wasmURL: new URL(wasmURL, window.location.href).href,
+			});
+			ffmpegRef.current = ffmpeg;
+		}
+		return ffmpeg;
+	}
+
+	async function convertFileToGif(file, clipStart, clipLength, outputPrefix = "loop") {
+		const ffmpeg = await getFFmpeg();
+		const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		const input = `input-${suffix}.mp4`;
+		const output = `${outputPrefix}-${suffix}.gif`;
 		try {
-			ffmpeg = ffmpegRef.current;
-			if (!ffmpeg) {
-				ffmpeg = new FFmpeg();
-				ffmpegLogsRef.current = [];
-				ffmpeg.on("log", ({ message }) => {
-					ffmpegLogsRef.current = [...ffmpegLogsRef.current.slice(-29), message];
-				});
-				ffmpeg.on("progress", ({ progress: p }) => setProgress(Math.max(0, Math.min(100, Math.round(p * 100)))));
-				// Bundle and serve the open-source FFmpeg core with the app. This avoids
-				// importing the core from a CDN/blob URL inside the FFmpeg web worker.
-				await ffmpeg.load({
-					coreURL: new URL(coreURL, window.location.href).href,
-					wasmURL: new URL(wasmURL, window.location.href).href,
-				});
-				ffmpegRef.current = ffmpeg;
-			}
-			input = `input-${Date.now()}.mp4`;
-			output = `loop-${Date.now()}.gif`;
-			await ffmpeg.writeFile(input, await fetchFile(videoFile));
-			const length = Math.max(0.2, end - start);
-			// split/palettegen produces a multi-output graph, so it must use
-			// -filter_complex and an explicit output map (not -vf).
+			await ffmpeg.writeFile(input, await fetchFile(file));
 			const filter = `fps=${fps},scale=${width}:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5[out]`;
 			const exitCode = await ffmpeg.exec([
 				"-ss",
-				String(start),
+				String(clipStart),
 				"-t",
-				String(length),
+				String(clipLength),
 				"-i",
 				input,
 				"-filter_complex",
@@ -190,8 +248,23 @@ function App() {
 				const details = ffmpegLogsRef.current.slice(-5).join(" ").trim();
 				throw new Error(details || `FFmpeg 結束代碼 ${exitCode}`);
 			}
-			const data = await ffmpeg.readFile(output);
-			setGifUrl(URL.createObjectURL(new Blob([data], { type: "image/gif" })));
+			return new Blob([await ffmpeg.readFile(output)], { type: "image/gif" });
+		} finally {
+			if (ffmpeg.loaded) {
+				await ffmpeg.deleteFile(input).catch(() => {});
+				await ffmpeg.deleteFile(output).catch(() => {});
+			}
+		}
+	}
+
+	async function convert() {
+		if (!videoFile) return;
+		setError("");
+		setStatus("converting");
+		setProgress(0);
+		try {
+			const gif = await convertFileToGif(videoFile, start, Math.max(0.2, end - start));
+			setGifUrl(URL.createObjectURL(gif));
 			setStatus("done");
 			setProgress(100);
 		} catch (e) {
@@ -205,17 +278,92 @@ function App() {
 			} else {
 				setError(`轉換失敗：${reason}`);
 			}
-			// A failed FFmpeg worker may be left in a bad state; recreate it on retry.
+			const ffmpeg = ffmpegRef.current;
 			if (ffmpeg) {
 				ffmpeg.terminate();
 				ffmpegRef.current = null;
 			}
 			setStatus("idle");
-		} finally {
-			if (ffmpeg?.loaded) {
-				if (input) await ffmpeg.deleteFile(input).catch(() => {});
-				if (output) await ffmpeg.deleteFile(output).catch(() => {});
+		}
+	}
+
+	function updateBatchJob(id, updates) {
+		setBatchJobs((items) => items.map((job) => (job.id === id ? { ...job, ...updates } : job)));
+	}
+
+	function readDuration(file) {
+		return new Promise((resolve, reject) => {
+			const source = URL.createObjectURL(file);
+			const video = document.createElement("video");
+			const cleanup = () => {
+				video.removeAttribute("src");
+				video.load();
+				URL.revokeObjectURL(source);
+			};
+			video.preload = "metadata";
+			video.onloadedmetadata = () => {
+				const value = video.duration;
+				cleanup();
+				resolve(value);
+			};
+			video.onerror = () => {
+				cleanup();
+				reject(new Error("無法讀取影片長度。"));
+			};
+			video.src = source;
+		});
+	}
+
+	async function resolveBatchVideo(job) {
+		const response = await fetch(`${RESOLVER}/resolve?url=${encodeURIComponent(job.url)}`);
+		const info = await response.json().catch(() => ({}));
+		if (!response.ok || !info.videoUrl) throw new Error(info.error || `讀取連結失敗 (${response.status})`);
+		const media = await fetch(`${RESOLVER}/media?url=${encodeURIComponent(info.videoUrl)}`);
+		if (!media.ok) {
+			const detail = await media.json().catch(() => ({}));
+			throw new Error(detail.error || `下載影片失敗 (${media.status})`);
+		}
+		const mediaType = media.headers.get("content-type") || "";
+		if (!mediaType.startsWith("video/") && !mediaType.includes("octet-stream")) {
+			throw new Error("貼文沒有傳回影片檔。");
+		}
+		const fileType = mediaType.startsWith("video/") ? mediaType : "video/mp4";
+		return new File([await media.blob()], `${job.name}.mp4`, { type: fileType });
+	}
+
+	async function processBatch() {
+		if (batchRunning || !batchJobs.length) return;
+		setBatchRunning(true);
+		setBatchZipUrl("");
+		setError("");
+		const completed = new Map(batchJobs.filter((job) => job.gifBlob).map((job) => [job.name, job.gifBlob]));
+		try {
+			for (const job of batchJobs.filter((item) => item.status !== "done")) {
+				setActiveBatchName(job.name);
+				setProgress(0);
+				updateBatchJob(job.id, { status: "resolving", error: "" });
+				try {
+					const file = await resolveBatchVideo(job);
+					const durationValue = await readDuration(file);
+					if (!Number.isFinite(durationValue) || durationValue < 0.2) throw new Error("影片長度無法辨識。");
+					updateBatchJob(job.id, { status: "converting" });
+					const gif = await convertFileToGif(file, 0, Math.min(batchClipSeconds, durationValue), `batch-${job.id}`);
+					completed.set(job.name, gif);
+					updateBatchJob(job.id, { status: "done", gifBlob: gif });
+				} catch (e) {
+					updateBatchJob(job.id, { status: "error", error: e.message || "處理失敗。" });
+				}
 			}
+			if (!completed.size) throw new Error("沒有成功轉換的 GIF。請確認連結可公開瀏覽後重試。");
+			const files = {};
+			for (const [name, gif] of completed) files[`${name}.gif`] = new Uint8Array(await gif.arrayBuffer());
+			const archive = zipSync(files, { level: 0 });
+			setBatchZipUrl(URL.createObjectURL(new Blob([archive], { type: "application/zip" })));
+		} catch (e) {
+			setError(e.message || "批次轉換失敗。");
+		} finally {
+			setActiveBatchName("");
+			setBatchRunning(false);
 		}
 	}
 
@@ -223,7 +371,8 @@ function App() {
 		setVideoFile(null);
 		setVideoSrc("");
 		setGifUrl("");
-		setUrl("");
+		setDownloadName("loop");
+		setLinkInputs([""]);
 		setError("");
 		setStatus("idle");
 		setProgress(0);
@@ -272,34 +421,111 @@ function App() {
 
 				<div className="workspace">
 					<div className="workspace-main">
-						{!active ? (
+						{!active && batchJobs.length > 0 ? (
+							<>
+								<div className="step-line">
+									<span className="step-number">02</span>
+									<span>批次轉換</span>
+									<span className="step-note">{batchJobs.length} 個 Threads 影片</span>
+								</div>
+								<div className="batch-settings">
+									<label>
+										每支影片從開頭取
+										<select
+											value={batchClipSeconds}
+											disabled={batchRunning}
+											onChange={(e) => setBatchClipSeconds(+e.target.value)}
+										>
+											<option value="2">2 秒</option>
+											<option value="3">3 秒</option>
+											<option value="5">5 秒</option>
+											<option value="6">6 秒</option>
+										</select>
+									</label>
+									<label>
+										寬度
+										<select value={width} disabled={batchRunning} onChange={(e) => setWidth(+e.target.value)}>
+											<option value="320">320 px</option>
+											<option value="480">480 px</option>
+											<option value="640">640 px</option>
+										</select>
+									</label>
+									<label>
+										影格速率
+										<select value={fps} disabled={batchRunning} onChange={(e) => setFps(+e.target.value)}>
+											<option value="8">8 fps</option>
+											<option value="12">12 fps</option>
+											<option value="15">15 fps</option>
+											<option value="20">20 fps</option>
+										</select>
+									</label>
+								</div>
+								<div className="batch-list" aria-live="polite">
+									{batchJobs.map((job, index) => (
+										<div className="batch-item" key={job.id}>
+											<span className="batch-index">{String(index + 1).padStart(2, "0")}</span>
+											<div className="batch-item-copy">
+												<strong>{job.name}</strong>
+												<small>
+													{job.status === "queued" && "等待轉換"}
+													{job.status === "resolving" && "正在讀取影片…"}
+													{job.status === "converting" && `正在製作 GIF… ${progress}%`}
+													{job.status === "done" && "完成"}
+													{job.status === "error" && "轉換失敗"}
+												</small>
+												{job.error && <small className="batch-error">{job.error}</small>}
+											</div>
+											{job.status === "done" && <Check className="batch-check" size={16} />}
+										</div>
+									))}
+								</div>
+								{batchRunning && (
+									<div className="batch-progress" aria-live="polite">
+										<LoaderCircle className="spin" size={15} />
+										<span>正在處理 {activeBatchName}，完成後會打包所有 GIF。</span>
+									</div>
+								)}
+								{batchZipUrl && (
+									<p className="batch-summary">
+										已完成 {batchJobs.filter((job) => job.status === "done").length} / {batchJobs.length} 支 GIF。
+									</p>
+								)}
+								<div className="batch-actions">
+									<Button
+										className="convert-button"
+										onClick={processBatch}
+										disabled={batchRunning || batchJobs.every((job) => job.status === "done")}
+									>
+										<Sparkles size={16} />{" "}
+										{batchJobs.some((job) => job.status === "error") ? "重試失敗項目" : "開始批次轉換"}
+									</Button>
+									{batchZipUrl && (
+										<a className="download-button" href={batchZipUrl} download="threads-gifs.zip">
+											<ArrowDownToLine size={16} /> 下載全部 GIF（ZIP）
+										</a>
+									)}
+									<button
+										className="batch-reset"
+										disabled={batchRunning}
+										onClick={() => {
+											setBatchJobs([]);
+											setBatchZipUrl("");
+											setLinkInputs([""]);
+											setError("");
+										}}
+									>
+										更換連結
+									</button>
+								</div>
+								<div className="privacy-note batch-privacy">
+									<LockKeyhole size={14} /> 影片逐支在瀏覽器處理，成功的 GIF 會一起打包下載
+								</div>
+							</>
+						) : !active ? (
 							<>
 								<div className="step-line">
 									<span className="step-number">01</span>
 									<span>加入你的影片</span>
-									<span className="step-note">公開 Threads 貼文或影片檔</span>
-								</div>
-								<div className="link-entry">
-									<div className="input-wrap">
-										<Link2 size={18} />
-										<input
-											aria-label="Threads 影片連結"
-											placeholder="貼上 Threads 連結…"
-											value={url}
-											onChange={(e) => setUrl(e.target.value)}
-											onKeyDown={(e) => e.key === "Enter" && loadFromLink()}
-										/>
-										<button
-											className="paste-btn"
-											onClick={async () => {
-												try {
-													setUrl(await navigator.clipboard.readText());
-												} catch {}
-											}}
-										>
-											貼上
-										</button>
-									</div>
 									<button
 										className="arrow-button"
 										aria-label="讀取連結"
@@ -308,6 +534,51 @@ function App() {
 									>
 										{status === "loading" ? <LoaderCircle className="spin" size={19} /> : <ArrowRight size={19} />}
 									</button>
+								</div>
+								<div className="links-entry-list">
+									{linkInputs.map((link, index) => (
+										<div className="link-entry" key={index}>
+											<div className="input-wrap">
+												<Link2 size={18} />
+												<input
+													aria-label={`Threads 影片連結 ${index + 1}`}
+													placeholder="貼上 Threads 影片連結…"
+													value={link}
+													onChange={(e) =>
+														setLinkInputs((current) =>
+															current.map((value, i) => (i === index ? e.target.value : value)),
+														)
+													}
+													onKeyDown={(e) => e.key === "Enter" && (e.metaKey || e.ctrlKey) && loadFromLink()}
+												/>
+												<button
+													className="paste-btn"
+													onClick={async () => {
+														try {
+															const text = await navigator.clipboard.readText();
+															setLinkInputs((current) => current.map((value, i) => (i === index ? text : value)));
+														} catch {}
+													}}
+												>
+													貼上
+												</button>
+											</div>
+											{linkInputs.length > 1 && (
+												<button
+													className="remove-link-button"
+													aria-label={`移除第 ${index + 1} 個連結欄位`}
+													onClick={() => setLinkInputs((current) => current.filter((_, i) => i !== index))}
+												>
+													<X size={16} />
+												</button>
+											)}
+										</div>
+									))}
+									{linkInputs.length < 8 && (
+										<button className="add-link-button" onClick={() => setLinkInputs((current) => [...current, ""])}>
+											<Plus size={12} /> 新增另一個連結
+										</button>
+									)}
 								</div>
 								<div className="or-divider">
 									<span>或</span>
@@ -491,10 +762,12 @@ function App() {
 												<Check size={13} /> 完成了
 											</span>
 											<strong>你的 GIF 已經準備好了。</strong>
-											<span>點擊下載，分享這個瞬間。</span>
-											<a className="download-button" href={gifUrl} download="loop.gif">
-												<ArrowDownToLine size={17} /> 下載 GIF
-											</a>
+											<span>你的 GIF 已準備好，可以下載。</span>
+											<div className="result-actions">
+												<a className="download-button" href={gifUrl} download={`${downloadName}.gif`}>
+													<ArrowDownToLine size={17} /> 下載 GIF
+												</a>
+											</div>
 										</div>
 									</div>
 								) : (
